@@ -857,6 +857,7 @@ with col_map:
             else:
                 st.warning("Selected item is no longer available.")
                 r = None
+            selected_raw = None
             if r is not None:
                 # Render known fields cleanly
                 def _fmt(k):
@@ -887,16 +888,11 @@ with col_map:
                 # show coordinates
                 if _fmt('latitude') and _fmt('longitude'):
                     st.markdown(f"**Coordinates:** { _fmt('latitude') }, { _fmt('longitude') }")
-                # show raw row for debug (avoid nested Streamlit containers which can
-                # raise StreamlitAPIException in some runtimes). Use a text area
-                # with a JSON dump instead.
+                # prepare raw dict for downstream Raw data expander (sibling, not nested)
                 try:
-                    raw = {k: (None if pd.isna(v) else v) for k, v in r.items()}
-                    st.text_area("Raw data (JSON)", value=json.dumps(raw, default=str, indent=2), height=240)
+                    selected_raw = {k: (None if pd.isna(v) else v) for k, v in r.items()}
                 except Exception:
-                    # fallback: simple key:value list
-                    simple = "\n".join(f"{k}: {None if pd.isna(v) else v}" for k, v in r.items())
-                    st.text_area("Raw data", value=simple, height=240)
+                    selected_raw = None
 
 st.divider()
 if st.button("🔄 Clear Chat"):
@@ -909,3 +905,24 @@ if st.button("🔄 Clear Chat"):
         except Exception:
             pass
     safe_rerun()
+
+# Show raw JSON and download button at top-level (sibling expander, not nested)
+selected = st.session_state.get("selected")
+if selected is not None:
+    # try to obtain the row from current results or full df
+    try:
+        if selected in st.session_state.get("results", pd.DataFrame()).index:
+            rrow = st.session_state["results"].loc[selected]
+        else:
+            rrow = df.loc[selected]
+        raw = {k: (None if pd.isna(v) else v) for k, v in rrow.items()}
+    except Exception:
+        raw = None
+    if raw is not None:
+        raw_json = json.dumps(raw, default=str, indent=2)
+        with st.expander("Raw data", expanded=False):
+            st.download_button(label="Download JSON", data=raw_json, file_name=f"kiez_item_{selected}.json", mime="application/json")
+            try:
+                st.json(raw)
+            except Exception:
+                st.text(raw_json)
