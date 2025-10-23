@@ -1,0 +1,65 @@
+@'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Kiez Simple Chat</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { font-family: system-ui, sans-serif; background:#fafafa; margin:0; }
+    .wrap { max-width: 680px; margin: 40px auto; background:#fff; border:1px solid #ddd; border-radius:14px; padding:16px; }
+    #log { height: 320px; overflow:auto; border:1px solid #eee; border-radius:10px; padding:10px; margin-top:8px; }
+    .row { display:flex; gap:8px; margin-top:10px; }
+    input { flex:1; padding:10px; border:1px solid #ccc; border-radius:10px; }
+    button { padding:10px 16px; border:1px solid #111; border-radius:10px; color:#fff; background:#111; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Kiez Simple Chat</h1>
+    <p>Backend: <code>http://127.0.0.1:8000</code></p>
+    <div id="log"></div>
+    <div class="row">
+      <input id="msg" placeholder="try: hello, help, who are you" />
+      <button id="send">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const API = "http://127.0.0.1:8000";
+    const log = document.getElementById("log");
+    const msg = document.getElementById("msg");
+    const sendBtn = document.getElementById("send");
+
+    function write(who, text){
+      const d = document.createElement("div");
+      d.innerHTML = `<b>${who}:</b> ${text}`;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function send(){
+      const text = msg.value.trim();
+      if(!text) return;
+      write("You", text);
+      msg.value="";
+      try{
+        const r = await fetch(API + "/chat", {
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({message:text})
+        });
+        const data = await r.json();
+        write("Bot", data.reply ?? JSON.stringify(data));
+      }catch(e){
+        write("Bot", "Error calling backend: " + e);
+      }
+    }
+    sendBtn.onclick = send;
+    msg.addEventListener("keydown", e => { if(e.key==="Enter") send(); });
+
+    write("Bot", "Hello! If you see this, the page works. Try typing 'hello'.");
+  </script>
+</body>
+</html>
+'@ | Set-Content -Encoding UTF8 .\chat.html
