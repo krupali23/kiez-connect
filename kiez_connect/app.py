@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import unicodedata
 import math
+import json
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -886,9 +887,16 @@ with col_map:
                 # show coordinates
                 if _fmt('latitude') and _fmt('longitude'):
                     st.markdown(f"**Coordinates:** { _fmt('latitude') }, { _fmt('longitude') }")
-                # show raw row for debug
-                with st.expander("Raw data"):
-                    st.json({k: (None if pd.isna(v) else v) for k, v in r.items()})
+                # show raw row for debug (avoid nested Streamlit containers which can
+                # raise StreamlitAPIException in some runtimes). Use a text area
+                # with a JSON dump instead.
+                try:
+                    raw = {k: (None if pd.isna(v) else v) for k, v in r.items()}
+                    st.text_area("Raw data (JSON)", value=json.dumps(raw, default=str, indent=2), height=240)
+                except Exception:
+                    # fallback: simple key:value list
+                    simple = "\n".join(f"{k}: {None if pd.isna(v) else v}" for k, v in r.items())
+                    st.text_area("Raw data", value=simple, height=240)
 
 st.divider()
 if st.button("🔄 Clear Chat"):
