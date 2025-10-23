@@ -413,16 +413,57 @@ with col_list:
     if results.empty:
         st.info("No results yet.")
     else:
+        # Helper: choose a friendly location string (avoid 'nan' and empty values)
+        def friendly_location(row):
+            for col in ("district", "location", "address"):
+                if col in row and pd.notna(row[col]):
+                    v = str(row[col]).strip()
+                    if v and v.lower() not in {"nan", "none", "nan.0"}:
+                        return v
+            return "Berlin"
+
+        # Helper: find the best link for a row and normalize it for clickable markdown
+        def best_link(row):
+            # Common link columns across datasets
+            candidates = [
+                "job_url_direct",
+                "job_url",
+                "link",
+                "url",
+                "company_url_direct",
+                "company_url",
+                "website",
+                "registration",
+                "appointment_url",
+                "booking_url",
+            ]
+            for col in candidates:
+                if col in row and pd.notna(row[col]):
+                    val = str(row[col]).strip()
+                    if not val:
+                        continue
+                    # If it's a bare domain like example.com, add scheme
+                    if val.startswith("www."):
+                        val = "https://" + val
+                    if val.startswith("http://") or val.startswith("https://"):
+                        return val
+            return None
+
+        def _first_text(row, cols, default=""):
+            for c in cols:
+                if c in row and pd.notna(row[c]):
+                    v = str(row[c]).strip()
+                    if v and v.lower() not in {"nan", "none", "nan.0"}:
+                        return v
+            return default
+
         for _, row in results.head(25).iterrows():
-            title = row.get("title", "No title")
-            location = row.get("district") or row.get("location") or "Berlin"
-            link = (
-                row.get("job_url_direct")
-                or row.get("job_url")
-                or row.get("link")
-                or row.get("url")
-            )
-            if isinstance(link, str) and link.startswith("http"):
+            title = _first_text(row, ["title", "course_name", "provider"], default="No title")
+            location = friendly_location(row)
+            link = best_link(row)
+
+            if link:
+                # Render title as a clickable link and show location below
                 st.markdown(f"**[{title}]({link})**  \n📍 {location}")
             else:
                 st.markdown(f"**{title}**  \n📍 {location}")
