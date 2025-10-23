@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import unicodedata
+import math
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -127,6 +128,87 @@ def bake_coords(df_in: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(df.at[i, "district"]) or not str(df.at[i, "district"]).strip():
                 df.at[i, "district"] = d.title()
     return df
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Return distance in kilometers between two lat/lon points."""
+    try:
+        # simple haversine
+        r = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return r * c
+    except Exception:
+        return float('inf')
+
+
+# Small reusable helpers used by multiple UI sections
+def _first_text(row, cols, default=""):
+    for c in cols:
+        if c in row and pd.notna(row[c]):
+            v = str(row[c]).strip()
+            if v and v.lower() not in {"nan", "none", "nan.0"}:
+                return v
+    return default
+
+
+def friendly_location(row):
+    for col in ("district", "location", "address"):
+        if col in row and pd.notna(row[col]):
+            v = str(row[col]).strip()
+            if v and v.lower() not in {"nan", "none", "nan.0"}:
+                return v
+    return "Berlin"
+
+
+def best_link(row):
+    candidates = [
+        "job_url_direct",
+        "job_url",
+        "link",
+        "url",
+        "company_url_direct",
+        "company_url",
+        "website",
+        "registration",
+        "appointment_url",
+        "booking_url",
+    ]
+    for col in candidates:
+        if col in row and pd.notna(row[col]):
+            val = str(row[col]).strip()
+            if not val:
+                continue
+            if val.startswith("www."):
+                val = "https://" + val
+            if val.startswith("http://") or val.startswith("https://"):
+                return val
+    return None
+
+
+# Safe rerun helper: some Streamlit builds expose different APIs
+def safe_rerun():
+    """Try to rerun the Streamlit script in a compatible way; fall back to st.stop()."""
+    try:
+        if hasattr(st, "experimental_rerun"):
+            try:
+                st.experimental_rerun()
+                return
+            except Exception:
+                pass
+        if hasattr(st, "rerun"):
+            try:
+                st.rerun()
+                return
+            except Exception:
+                pass
+    except Exception:
+        # defensive: if something unexpected happens, fall through to stop
+        pass
+    # last-resort: stop execution and wait for user interaction
+    st.stop()
 
 
 # -------------------------------------------------
@@ -361,6 +443,27 @@ if query:
     st.chat_message("user").write(query)
     q = query.lower()
 
+    # --- Friendly greeting handling ---
+    greetings = ("hi", "hello", "hey", "hallo", "greetings")
+    if any(q.strip().startswith(g) for g in greetings):
+        # Ask a friendly follow-up to engage the user
+        st.chat_message("assistant").write(
+            "Hey — what can I do for you? You can ask me to show jobs, events, or German courses."
+        )
+        # do not run the search below on a bare greeting
+        # allow quick follow-up by returning early
+        st.session_state.most_recent_query = q
+        # Some Streamlit builds may not expose experimental_rerun; fall back to
+        # stopping the script which preserves session_state for the next user
+        # interaction.
+        if hasattr(st, "experimental_rerun"):
+            try:
+                st.experimental_rerun()
+            except Exception:
+                st.stop()
+        else:
+            st.stop()
+
     topic = None
     if "job" in q:
         topic = "job"
@@ -369,7 +472,85 @@ if query:
     elif "course" in q or "german" in q:
         topic = "course"
 
+    # remember last topic for UI state
+    st.session_state['last_topic'] = topic or st.session_state.get('last_topic')
+
     loc_key = detect_district(q)
+    # Follow-up prompts: if user asked for a topic (event/job/course), ask scope & display
+    scope = None
+    display_pref = None  # 'address' or 'map'
+    if topic:
+        # small dialog to ask how to scope results and what to show
+        # preserve previous answers in session_state for smoother UX
+        s_key = f"followup_scope_{topic}"
+        d_key = f"followup_display_{topic}"
+        if s_key not in st.session_state:
+            st.session_state[s_key] = "all"
+        if d_key not in st.session_state:
+            st.session_state[d_key] = "map"
+
+        # ensure extra per-topic state exists
+        r_key = f"followup_radius_{topic}"
+        u_key = f"followup_use_my_location_{topic}"
+        lat_key = f"followup_my_lat_{topic}"
+        lon_key = f"followup_my_lon_{topic}"
+        if r_key not in st.session_state:
+            st.session_state[r_key] = 3.0
+        if u_key not in st.session_state:
+            st.session_state[u_key] = False
+        if lat_key not in st.session_state:
+            st.session_state[lat_key] = 52.52
+        if lon_key not in st.session_state:
+            st.session_state[lon_key] = 13.405
+
+        with st.form(key=f"followup_form_{q}", clear_on_submit=False):
+            cols = st.columns([0.56, 0.44])
+            with cols[0]:
+                if loc_key:
+                    st.write(f"Where should I search for {topic}s? (detected: {loc_key.title()})")
+                    scope_choice = st.radio(
+                        "Scope:",
+                        [f"Only {loc_key.title()}", "All Berlin", f"Nearby {loc_key.title()} (within radius)"],
+                    )
+                else:
+                    st.write(f"Where should I search for {topic}s?")
+                    scope_choice = st.radio("Scope:", ["All Berlin", "Nearby current location (within radius)"])
+
+                # radius control (km)
+                radius_val = st.slider("Nearby radius (km)", min_value=0.5, max_value=20.0, value=float(st.session_state[r_key]), step=0.5)
+
+                # option to use user's coordinates instead of district centroid
+                use_my = st.checkbox("Use my location (enter coords below)", value=st.session_state[u_key])
+                my_lat = None
+                my_lon = None
+                if use_my:
+                    my_lat = st.number_input("My latitude", value=float(st.session_state[lat_key]), format="%.6f")
+                    my_lon = st.number_input("My longitude", value=float(st.session_state[lon_key]), format="%.6f")
+            with cols[1]:
+                display_choice = st.radio("Show as:", ["Map pins", "Address list"], index=0)
+            submitted = st.form_submit_button("Search")
+
+        if submitted:
+            # translate choices into internal flags
+            if "Only" in scope_choice:
+                scope = "only"
+            elif "Nearby" in scope_choice:
+                scope = "nearby"
+            else:
+                scope = "all"
+            display_pref = "address" if display_choice.startswith("Address") else "map"
+            # persist the choices per-topic
+            st.session_state[s_key] = scope
+            st.session_state[d_key] = display_pref
+            st.session_state[r_key] = float(radius_val)
+            st.session_state[u_key] = bool(use_my)
+            if my_lat is not None and my_lon is not None:
+                st.session_state[lat_key] = float(my_lat)
+                st.session_state[lon_key] = float(my_lon)
+        else:
+            # use prior saved values if user didn't submit the form yet
+            scope = st.session_state.get(s_key, "all")
+            display_pref = st.session_state.get(d_key, "map")
     keywords = ["developer", "engineer", "data", "design", "marketing", "teacher", "python", "manager"]
     keyword = next((k for k in keywords if k in q), None)
 
@@ -377,10 +558,48 @@ if query:
     if topic:
         subset = subset[subset["type"] == topic]
     if loc_key:
-        subset = subset[
-            subset["district"].fillna("").str.lower().str.contains(loc_key)
-            | subset["location"].fillna("").str.lower().str.contains(loc_key)
-        ]
+        if scope == "only":
+            subset = subset[
+                subset["district"].fillna("").str.lower().str.contains(loc_key)
+                | subset["location"].fillna("").str.lower().str.contains(loc_key)
+            ]
+        elif scope == "all":
+            # no filtering, keep all Berlin results
+            pass
+        else:
+            # nearby: compute rows within configured radius (km).
+            try:
+                # radius and optional user coords saved per-topic
+                r_key = f"followup_radius_{topic}"
+                u_key = f"followup_use_my_location_{topic}"
+                lat_key = f"followup_my_lat_{topic}"
+                lon_key = f"followup_my_lon_{topic}"
+                radius_km = float(st.session_state.get(r_key, 3.0))
+
+                if st.session_state.get(u_key, False):
+                    lat0 = float(st.session_state.get(lat_key, DISTRICT_CENTROIDS.get(loc_key, DISTRICT_CENTROIDS["berlin"])[0]))
+                    lon0 = float(st.session_state.get(lon_key, DISTRICT_CENTROIDS.get(loc_key, DISTRICT_CENTROIDS["berlin"])[1]))
+                else:
+                    lat0, lon0 = DISTRICT_CENTROIDS.get(loc_key, DISTRICT_CENTROIDS["berlin"])
+
+                # ensure coords present
+                subset = bake_coords(subset)
+                mask = []
+                for _, r in subset.iterrows():
+                    try:
+                        lat = float(r.get("latitude") or lat0)
+                        lon = float(r.get("longitude") or lon0)
+                        dkm = _haversine_km(lat0, lon0, lat, lon)
+                        mask.append(dkm <= float(radius_km))
+                    except Exception:
+                        mask.append(False)
+                subset = subset.loc[mask]
+            except Exception:
+                # fallback to substring matching
+                subset = subset[
+                    subset["district"].fillna("").str.lower().str.contains(loc_key)
+                    | subset["location"].fillna("").str.lower().str.contains(loc_key)
+                ]
     if keyword:
         search_cols = [c for c in ["title", "company", "provider", "course_name"] if c in subset.columns]
         subset = subset[
@@ -389,6 +608,40 @@ if query:
 
     subset = bake_coords(subset)
     st.session_state.results = subset
+
+    # If the user asked for details about a course/job by name, try to find a match
+    def _find_and_select(text, df):
+        t = _normalize_text(text)
+        if not t:
+            return None
+        # search title, course_name, provider, company
+        for col in ("title", "course_name", "provider", "company"):
+            if col in df.columns:
+                for idx, val in df[col].dropna().items():
+                    if t in _normalize_text(str(val)):
+                        return idx
+        return None
+
+    # look for explicit detail requests like "who runs [course]" or if query contains a known title
+    if any(word in q for word in ("who", "who runs", "details", "tell me about", "more info", "provider")):
+        pick = _find_and_select(q, subset) or _find_and_select(q, df)
+        if pick is not None:
+            st.session_state.selected = int(pick)
+            # show assistant message with the short details
+            r = (subset if pick in subset.index else df).loc[pick]
+            provider = r.get("provider") or r.get("company") or "Unknown"
+            title_text = r.get("title") or r.get("course_name") or "Item"
+            link = None
+            for c in ("url", "link", "job_url_direct", "job_url", "registration", "appointment_url", "booking_url"):
+                if c in r and pd.notna(r[c]):
+                    link = str(r[c])
+                    break
+            msg = f"Here are the details for **{title_text}**:\n- Provider: {provider}"
+            if link:
+                msg += f"\n- Link: {link}"
+            if pd.notna(r.get("location")):
+                msg += f"\n- Location: {r.get('location')}"
+            st.chat_message("assistant").write(msg)
 
     if subset.empty:
         st.chat_message("assistant").write("❌ No matches found. Try another keyword or district.")
@@ -400,7 +653,56 @@ if query:
         else:
             label = "results"
         loc_label = (loc_key or "Berlin").title()
-        st.chat_message("assistant").write(f"{emoji} Found **{len(subset)} {label}** in **{loc_label}**.")
+        # include display preference in assistant message
+        if display_pref == "address":
+            show_txt = "addresses and details"
+        else:
+            show_txt = "map pins and details"
+        st.chat_message("assistant").write(f"{emoji} Found **{len(subset)} {label}** in **{loc_label}**. Showing {show_txt}.")
+
+        # --- Render a compact, human-friendly summary of the first few items ---
+        def _render_summary(rows: pd.DataFrame, n=5):
+            pieces = []
+            for _, r in rows.head(n).iterrows():
+                title = _first_text(r, ["title", "course_name", "provider"], default="No title")
+                # find a link if present
+                link = None
+                for c in ("url", "link", "job_url_direct", "job_url", "registration", "appointment_url", "booking_url", "website"):
+                    if c in r and pd.notna(r[c]):
+                        l = str(r[c]).strip()
+                        if l.startswith("www."):
+                            l = "https://" + l
+                        if l.startswith("http://") or l.startswith("https://"):
+                            link = l
+                            break
+                when = None
+                for c in ("when", "date", "start_time", "time"):
+                    if c in r and pd.notna(r[c]):
+                        when = str(r[c])
+                        break
+                location = friendly_location(r)
+                addr_line = None
+                # If user specifically asked for address list, show address field if available
+                if display_pref == "address":
+                    for ac in ("address", "location", "district"):
+                        if ac in r and pd.notna(r[ac]):
+                            addr_line = str(r[ac])
+                            break
+                line = f"**{title}**"
+                if link:
+                    line = f"[{title}]({link})"
+                meta = []
+                if when:
+                    meta.append(f"When: {when}")
+                meta.append(f"Location: {location}")
+                if addr_line:
+                    meta.append(f"Address: {addr_line}")
+                pieces.append(line + "  \n" + " | ".join(meta))
+            return "\n\n".join(pieces)
+
+        summary_md = _render_summary(subset)
+        if summary_md:
+            st.chat_message("assistant").write(summary_md)
 
 
 # =====================================================
@@ -457,16 +759,39 @@ with col_list:
                         return v
             return default
 
+        # detect display preference from session
+        display_pref_list = st.session_state.get(f"followup_display_{st.session_state.get('last_topic', '')}", None)
+        # fallback if not set
+        if not display_pref_list:
+            # try any topic-specific stored value
+            for k in st.session_state.keys():
+                if k.startswith("followup_display_"):
+                    display_pref_list = st.session_state[k]
+                    break
+
         for _, row in results.head(25).iterrows():
             title = _first_text(row, ["title", "course_name", "provider"], default="No title")
             location = friendly_location(row)
             link = best_link(row)
-
-            if link:
-                # Render title as a clickable link and show location below
-                st.markdown(f"**[{title}]({link})**  \n📍 {location}")
-            else:
-                st.markdown(f"**{title}**  \n📍 {location}")
+            addr_line = None
+            if display_pref_list == "address":
+                for ac in ("address", "location", "district"):
+                    if ac in row and pd.notna(row[ac]):
+                        addr_line = str(row[ac])
+                        break
+            cols = st.columns([0.85, 0.15])
+            with cols[0]:
+                if link:
+                    st.markdown(f"**[{title}]({link})**  \n📍 {location}")
+                else:
+                    st.markdown(f"**{title}**  \n📍 {location}")
+                if addr_line:
+                    st.markdown(f"**Address:** {addr_line}")
+            with cols[1]:
+                key = f"details_{int(row.name)}"
+                if st.button("Details", key=key):
+                    st.session_state.selected = int(row.name)
+                    safe_rerun()
             st.markdown("---")
 
 
@@ -518,7 +843,61 @@ with col_map:
         view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=11)
         st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip))
 
+    # Details panel: show full details for selected result
+    selected = st.session_state.get("selected")
+    with st.expander("Details", expanded=True):
+        if selected is None:
+            st.info("Select a row's Details button to see more information here.")
+        else:
+            if selected in results.index:
+                r = results.loc[selected]
+            elif selected in df.index:
+                r = df.loc[selected]
+            else:
+                st.warning("Selected item is no longer available.")
+                r = None
+            if r is not None:
+                # Render known fields cleanly
+                def _fmt(k):
+                    v = r.get(k)
+                    if pd.isna(v):
+                        return None
+                    return str(v)
+
+                st.markdown(f"### { _fmt('title') or _fmt('course_name') or 'Details' }")
+                provider = _fmt('provider') or _fmt('company')
+                if provider:
+                    st.markdown(f"**Provider:** {provider}")
+                if _fmt('location'):
+                    st.markdown(f"**Location:** {_fmt('location')}")
+                if _fmt('district'):
+                    st.markdown(f"**District:** {_fmt('district')}")
+                if _fmt('price'):
+                    st.markdown(f"**Price:** {_fmt('price')}")
+                if _fmt('duration'):
+                    st.markdown(f"**Duration:** {_fmt('duration')}")
+                if _fmt('level'):
+                    st.markdown(f"**Level:** {_fmt('level')}")
+                # show contact / link
+                for c in ("url", "link", "job_url_direct", "job_url", "website", "registration", "appointment_url", "booking_url"):
+                    if _fmt(c):
+                        st.markdown(f"**Link:** [{_fmt(c)}]({_fmt(c)})")
+                        break
+                # show coordinates
+                if _fmt('latitude') and _fmt('longitude'):
+                    st.markdown(f"**Coordinates:** { _fmt('latitude') }, { _fmt('longitude') }")
+                # show raw row for debug
+                with st.expander("Raw data"):
+                    st.json({k: (None if pd.isna(v) else v) for k, v in r.items()})
+
 st.divider()
 if st.button("🔄 Clear Chat"):
     st.session_state.results = df.copy()
-    st.rerun()
+    # clear any persisted followup_* keys so next chat starts fresh
+    keys_to_remove = [k for k in list(st.session_state.keys()) if k.startswith("followup_")]
+    for k in keys_to_remove:
+        try:
+            del st.session_state[k]
+        except Exception:
+            pass
+    safe_rerun()
